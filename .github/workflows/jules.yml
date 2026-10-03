@@ -1,0 +1,153 @@
+# managed-by: RLuf/ai-bots — edite o template em RLuf/ai-bots e rode o sync; alterações feitas aqui são sobrescritas.
+#
+# Aciona o Jules (Google) pela API quando OWNER/MEMBER/COLLABORATOR menciona @jules
+# em issue, comentário de issue/PR ou review. O Jules abre uma sessão e cria um PR.
+# Em PRs criados pelo próprio Jules o workflow não roda: lá o Jules App já responde
+# sozinho aos comentários (evita sessão duplicada). O rótulo "jules" em issue também
+# é tratado nativamente pelo Jules App, sem passar por aqui.
+name: Jules
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  issues:
+    types: [opened]
+
+concurrency:
+  group: jules-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  jules:
+    if: |
+      github.event.sender.type == 'User' &&
+      !contains(github.event.issue.user.login || github.event.pull_request.user.login, 'jules') &&
+      (
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@jules') &&
+          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@jules') &&
+          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+        (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@jules') &&
+          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association)) ||
+        (github.event_name == 'issues' && (contains(github.event.issue.body, '@jules') || contains(github.event.issue.title, '@jules')) &&
+          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association))
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Check secret
+        id: pre
+        env:
+          TOKEN: ${{ secrets.JULES_API_KEY }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::warning::Secret JULES_API_KEY ausente neste repo; Jules não vai rodar."
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build context
+        if: steps.pre.outputs.ok == 'true'
+        id: ctx
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          IS_PR: ${{ github.event.issue.pull_request != null || github.event.pull_request != null }}
+          ITEM_URL: ${{ github.event.issue.html_url || github.event.pull_request.html_url }}
+          ITEM_TITLE: ${{ github.event.issue.title || github.event.pull_request.title }}
+          ITEM_BODY: ${{ github.event.issue.body || github.event.pull_request.body }}
+          REQUEST: ${{ github.event.comment.body || github.event.review.body || github.event.issue.body }}
+          FILE_PATH: ${{ github.event.comment.path }}
+          FILE_LINE: ${{ github.event.comment.line }}
+        run: |
+          set -euo pipefail
+          branch="$DEFAULT_BRANCH"
+          kind="issue"
+          if [ "$IS_PR" = "true" ]; then
+            kind="pull request"
+            head=$(gh pr view "$NUMBER" -R "$REPO" --json headRefName,isCrossRepository \
+                   --jq 'if .isCrossRepository then "" else .headRefName end')
+            # só aceita nome de branch "limpo"; senão volta para a branch padrão
+            if [[ -n "$head" && "$head" =~ ^[A-Za-z0-9._/-]+$ ]]; then branch="$head"; fi
+          fi
+          {
+            echo "Repositório: $REPO"
+            echo "Origem: $kind #$NUMBER — $ITEM_URL"
+            echo "Título: $ITEM_TITLE"
+            echo
+            echo "Descrição:"
+            echo "${ITEM_BODY:-(vazia)}"
+            echo
+            if [ -n "${FILE_PATH:-}" ]; then echo "Comentário no arquivo $FILE_PATH, linha ${FILE_LINE:-?}."; fi
+            echo "Pedido de quem chamou @jules:"
+            echo "$REQUEST"
+            echo
+            if [ "$kind" = "pull request" ]; then
+              echo "Trabalhe sobre a branch '$branch' do PR #$NUMBER e abra um PR com as mudanças pedidas."
+            else
+              echo "Resolva a issue #$NUMBER e abra um PR que a referencie (\"Fixes #$NUMBER\")."
+            fi
+          } > prompt.txt
+          jq -n --rawfile prompt prompt.txt \
+                --arg title "[$REPO#$NUMBER] $ITEM_TITLE" \
+                --arg source "sources/github/$REPO" \
+                --arg branch "$branch" \
+            '{prompt:$prompt, title:$title,
+              sourceContext:{source:$source, githubRepoContext:{startingBranch:$branch}},
+              requirePlanApproval:false, automationMode:"AUTO_CREATE_PR"}' > payload.json
+          echo "number=$NUMBER" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Invoke Jules
+        if: steps.pre.outputs.ok == 'true'
+        id: invoke
+        env:
+          JULES_API_KEY: ${{ secrets.JULES_API_KEY }}
+        run: |
+          set -euo pipefail
+          code=$(curl -sS -o resp.json -w '%{http_code}' -X POST \
+            'https://jules.googleapis.com/v1alpha/sessions' \
+            -H 'Content-Type: application/json' \
+            -H "X-Goog-Api-Key: $JULES_API_KEY" \
+            -d @payload.json)
+          if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+            echo "::error::Jules API respondeu HTTP $code"
+            jq -r '.error.message // .' resp.json || cat resp.json
+            echo "error=HTTP $code: $(jq -r '.error.message // "sem detalhe"' resp.json 2>/dev/null)" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          url=$(jq -r '.url // empty' resp.json)
+          name=$(jq -r '.name // empty' resp.json)
+          echo "session=${url:-$name}" >> "$GITHUB_OUTPUT"
+
+      - name: Acknowledge
+        if: always() && steps.pre.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ steps.ctx.outputs.number }}
+          BRANCH: ${{ steps.ctx.outputs.branch }}
+          SESSION: ${{ steps.invoke.outputs.session }}
+          ERR: ${{ steps.invoke.outputs.error }}
+          OUTCOME: ${{ steps.invoke.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          [ -n "${NUMBER:-}" ] || exit 0
+          if [ "$OUTCOME" = "success" ]; then
+            msg="🤖 @$ACTOR, o Jules recebeu o pedido e abriu uma sessão a partir de \`$BRANCH\`: ${SESSION:-ver log}. Ele vai abrir um PR quando terminar. [Log]($RUN_URL)"
+          else
+            msg="🤖 @$ACTOR, não consegui acionar o Jules (${ERR:-erro desconhecido}). Confira se o Jules App tem acesso a este repo e se o JULES_API_KEY é válido. [Log]($RUN_URL)"
+          fi
+          gh issue comment "$NUMBER" -R "$REPO" --body "$msg"
